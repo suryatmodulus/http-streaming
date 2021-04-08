@@ -5,6 +5,7 @@ import videojs from 'video.js';
 import SourceUpdater from '../src/source-updater';
 import {mp4VideoInit, mp4AudioInit, mp4Video, mp4Audio} from 'create-test-data!segments';
 import { timeRangesEqual } from './custom-assertions.js';
+import { QUOTA_EXCEEDED_ERR } from '../src/error-codes';
 
 const checkInitialDuration = function({duration}) {
   // ie sometimes sets duration to infinity earlier then expected
@@ -44,14 +45,21 @@ const mp4AudioTotal = () => concatSegments(mp4AudioInit(), mp4Audio());
 
 QUnit.module('Source Updater', {
   beforeEach() {
-    const video = document.createElement('video');
+    this.fixture = document.getElementById('qunit-fixture');
+    this.video = document.createElement('video');
+
+    this.fixture.appendChild(this.video);
 
     this.mediaSource = new window.MediaSource();
 
     // need to attach the real media source to a video element for the media source to
     // change to an open ready state
-    video.src = URL.createObjectURL(this.mediaSource);
+    this.video.src = URL.createObjectURL(this.mediaSource);
     this.sourceUpdater = new SourceUpdater(this.mediaSource);
+
+    // This is normally done at the top level of the plugin, but will not happen in
+    // an isolated module.
+    this.sourceUpdater.initializedEme();
 
     // wait for the source to open (or error) before running through tests
     return new Promise((accept, reject) => {
@@ -62,6 +70,8 @@ QUnit.module('Source Updater', {
 
   afterEach() {
     this.sourceUpdater.dispose();
+    this.video.src = '';
+    this.fixture.removeChild(this.video);
   }
 });
 
@@ -162,6 +172,7 @@ QUnit.test('verifies that sourcebuffer is in source buffers list before attempti
   };
 
   this.sourceUpdater = new SourceUpdater(createMediaSource());
+  this.sourceUpdater.initializedEme();
   this.sourceUpdater.createSourceBuffers({
     audio: 'mp4a.40.2',
     video: 'avc1.4d400d'
@@ -179,6 +190,7 @@ QUnit.test('verifies that sourcebuffer is in source buffers list before attempti
 
   this.sourceUpdater.dispose();
   this.sourceUpdater = new SourceUpdater(createMediaSource());
+  this.sourceUpdater.initializedEme();
   this.sourceUpdater.createSourceBuffers({
     audio: 'mp4a.40.2',
     video: 'avc1.4d400d'
@@ -335,13 +347,15 @@ QUnit.test('setting audio timestamp offset without buffer is a noop', function(a
 });
 
 QUnit.test('ready with a video buffer', function(assert) {
+  this.sourceUpdater.initializedEme();
   this.sourceUpdater.createSourceBuffers({
     video: 'avc1.4d400d'
   });
-  assert.ok(this.sourceUpdater.ready(), 'source updater is ready');
+  assert.ok(this.sourceUpdater.ready(), 'source updater has started');
 });
 
 QUnit.test('ready with an audio buffer', function(assert) {
+  this.sourceUpdater.initializedEme();
   this.sourceUpdater.createSourceBuffers({
     audio: 'mp4a.40.2'
   });
@@ -349,10 +363,24 @@ QUnit.test('ready with an audio buffer', function(assert) {
 });
 
 QUnit.test('ready with both an audio and video buffer', function(assert) {
+  this.sourceUpdater.initializedEme();
   this.sourceUpdater.createSourceBuffers({
     video: 'avc1.4d400d',
     audio: 'mp4a.40.2'
   });
+  assert.ok(this.sourceUpdater.ready(), 'source updater is ready');
+});
+
+QUnit.test('ready once source buffers created and eme initialized', function(assert) {
+  // the module initializes by default
+  this.sourceUpdater.initializedEme_ = false;
+  assert.notOk(this.sourceUpdater.ready(), 'source updater is not ready');
+  this.sourceUpdater.createSourceBuffers({
+    video: 'avc1.4d400d',
+    audio: 'mp4a.40.2'
+  });
+  assert.notOk(this.sourceUpdater.ready(), 'source updater is not ready');
+  this.sourceUpdater.initializedEme();
   assert.ok(this.sourceUpdater.ready(), 'source updater is ready');
 });
 
@@ -1284,5 +1312,40 @@ QUnit[testOrSkip]('audio appends are delayed until video append for the first ap
   this.sourceUpdater.appendBuffer({type: 'video', bytes: mp4VideoTotal()}, () => {
     videoAppend = true;
     assert.ok(!audioAppend, 'audio has not appended yet');
+  });
+});
+
+QUnit.test('appendBuffer calls back with QUOTA_EXCEEDED_ERR', function(assert) {
+  assert.expect(2);
+
+  this.sourceUpdater.createSourceBuffers({
+    audio: 'mp4a.40.2',
+    video: 'avc1.4D001E'
+  });
+
+  const videoBuffer = {
+    appendBuffer() {
+      const quotaExceededError = new Error();
+
+      quotaExceededError.code = QUOTA_EXCEEDED_ERR;
+
+      throw quotaExceededError;
+    }
+  };
+
+  const origMediaSource = this.sourceUpdater.mediaSource;
+  const origVideoBuffer = this.sourceUpdater.videoBuffer;
+
+  // mock the media source and video buffer since you can't modify the native buffer
+  this.sourceUpdater.videoBuffer = videoBuffer;
+  this.sourceUpdater.mediaSource = {
+    sourceBuffers: [videoBuffer]
+  };
+
+  this.sourceUpdater.appendBuffer({type: 'video', bytes: mp4VideoTotal()}, (err) => {
+    assert.equal(err.code, QUOTA_EXCEEDED_ERR, 'called back with error');
+    assert.notOk(this.sourceUpdater.queuePending.video, 'no pending action');
+    this.sourceUpdater.mediaSource = origMediaSource;
+    this.sourceUpdater.videoBuffer = origVideoBuffer;
   });
 });

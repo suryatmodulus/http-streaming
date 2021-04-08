@@ -12,21 +12,37 @@ export const createPlaylistID = (index, uri) => {
 /**
  * Parses a given m3u8 playlist
  *
+ * @param {Function} [onwarn]
+ *        a function to call when the parser triggers a warning event.
+ * @param {Function} [oninfo]
+ *        a function to call when the parser triggers an info event.
  * @param {string} manifestString
  *        The downloaded manifest string
  * @param {Object[]} [customTagParsers]
  *        An array of custom tag parsers for the m3u8-parser instance
  * @param {Object[]} [customTagMappers]
- *         An array of custom tag mappers for the m3u8-parser instance
+ *        An array of custom tag mappers for the m3u8-parser instance
+ * @param {boolean} [experimentalLLHLS=false]
+ *        Whether to keep ll-hls features in the manifest after parsing.
  * @return {Object}
  *         The manifest object
  */
 export const parseManifest = ({
+  onwarn,
+  oninfo,
   manifestString,
   customTagParsers = [],
-  customTagMappers = []
+  customTagMappers = [],
+  experimentalLLHLS
 }) => {
   const parser = new M3u8Parser();
+
+  if (onwarn) {
+    parser.on('warn', onwarn);
+  }
+  if (oninfo) {
+    parser.on('info', oninfo);
+  }
 
   customTagParsers.forEach(customParser => parser.addParser(customParser));
   customTagMappers.forEach(mapper => parser.addTagMapper(mapper));
@@ -34,7 +50,49 @@ export const parseManifest = ({
   parser.push(manifestString);
   parser.end();
 
-  return parser.manifest;
+  const manifest = parser.manifest;
+
+  // remove llhls features from the parsed manifest
+  // if we don't want llhls support.
+  if (!experimentalLLHLS) {
+    [
+      'preloadSegment',
+      'skip',
+      'serverControl',
+      'renditionReports',
+      'partInf',
+      'partTargetDuration'
+    ].forEach(function(k) {
+      if (manifest.hasOwnProperty(k)) {
+        delete manifest[k];
+      }
+    });
+
+    if (manifest.segments) {
+      manifest.segments.forEach(function(segment) {
+        ['parts', 'preloadHints'].forEach(function(k) {
+          if (segment.hasOwnProperty(k)) {
+            delete segment[k];
+          }
+        });
+      });
+    }
+  }
+  if (!manifest.targetDuration) {
+    let targetDuration = 10;
+
+    if (manifest.segments && manifest.segments.length) {
+      targetDuration = manifest
+        .segments.reduce((acc, s) => Math.max(acc, s.duration), 0);
+    }
+
+    if (onwarn) {
+      onwarn(`manifest has no targetDuration defaulting to ${targetDuration}`);
+    }
+    manifest.targetDuration = targetDuration;
+  }
+
+  return manifest;
 };
 
 /**
@@ -99,32 +157,18 @@ export const setupMediaPlaylist = ({ playlist, uri, id }) => {
  *
  * @param {Object} master
  *        The master playlist
- * @param {boolean} [useNameForId=false]
- *        Whether we should use the NAME property for ID.
- *        Generally only used for DASH and defaults to false.
  */
-export const setupMediaPlaylists = (master, useNameForId) => {
+export const setupMediaPlaylists = (master) => {
   let i = master.playlists.length;
 
   while (i--) {
     const playlist = master.playlists[i];
-    const createdId = createPlaylistID(i, playlist.uri);
-    let id = createdId;
-
-    // If useNameForId is set, use the NAME attribute for the ID.
-    // Generally, this will be used for DASH because
-    // DASH Representations can change order across refreshes which can make referring to them by index not work.
-    if (useNameForId) {
-      id = playlist.attributes && playlist.attributes.NAME || id;
-    }
 
     setupMediaPlaylist({
       playlist,
-      id
+      id: createPlaylistID(i, playlist.uri)
     });
     playlist.resolvedUri = resolveUrl(master.uri, playlist.uri);
-    // make sure that if a useNameForId is true, the old "createdId" id is also available
-    master.playlists[createdId] = playlist;
     master.playlists[playlist.id] = playlist;
     // URI reference added for backwards compatibility
     master.playlists[playlist.uri] = playlist;
@@ -201,11 +245,8 @@ export const masterForMedia = (media, uri) => {
  *        Master manifest object
  * @param {string} uri
  *        The source URI
- * @param {boolean} [useNameForId=false]
- *        Whether we should use the NAME property for ID.
- *        Generally only used for DASH and defaults to false.
  */
-export const addPropertiesToMaster = (master, uri, useNameForId = false) => {
+export const addPropertiesToMaster = (master, uri) => {
   master.uri = uri;
 
   for (let i = 0; i < master.playlists.length; i++) {
@@ -238,6 +279,6 @@ export const addPropertiesToMaster = (master, uri, useNameForId = false) => {
     master.playlists[phonyUri] = properties.playlists[0];
   });
 
-  setupMediaPlaylists(master, useNameForId);
+  setupMediaPlaylists(master);
   resolveMediaGroupUris(master);
 };

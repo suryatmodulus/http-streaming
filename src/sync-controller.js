@@ -6,6 +6,12 @@ import {sumDurations} from './playlist';
 import videojs from 'video.js';
 import logger from './util/logger';
 
+const getSegmentIndex = (i, playlist, currentTime = 0) => {
+  const segments = playlist.segments;
+
+  return (playlist.endList || currentTime === 0) ? i : segments.length - (i + 1);
+};
+
 export const syncPointStrategies = [
   // Stategy "VOD": Handle the VOD-case where the sync-point is *always*
   //                the equivalence display-time 0 === segment-index 0
@@ -27,7 +33,7 @@ export const syncPointStrategies = [
   {
     name: 'ProgramDateTime',
     run: (syncController, playlist, duration, currentTimeline, currentTime) => {
-      if (!syncController.datetimeToDisplayTime) {
+      if (!Object.keys(syncController.timelineToDatetimeMappings).length) {
         return null;
       }
 
@@ -38,11 +44,18 @@ export const syncPointStrategies = [
       currentTime = currentTime || 0;
 
       for (let i = 0; i < segments.length; i++) {
-        const segment = segments[i];
+        const segmentIndex = getSegmentIndex(i, playlist, currentTime);
+        const segment = segments[segmentIndex];
+        const datetimeMapping =
+          syncController.timelineToDatetimeMappings[segment.timeline];
+
+        if (!datetimeMapping) {
+          continue;
+        }
 
         if (segment.dateTimeObject) {
           const segmentTime = segment.dateTimeObject.getTime() / 1000;
-          const segmentStart = segmentTime + syncController.datetimeToDisplayTime;
+          const segmentStart = segmentTime + datetimeMapping;
           const distance = Math.abs(currentTime - segmentStart);
 
           // Once the distance begins to increase, or if distance is 0, we have passed
@@ -54,7 +67,7 @@ export const syncPointStrategies = [
           lastDistance = distance;
           syncPoint = {
             time: segmentStart,
-            segmentIndex: i
+            segmentIndex
           };
         }
       }
@@ -73,7 +86,8 @@ export const syncPointStrategies = [
       currentTime = currentTime || 0;
 
       for (let i = 0; i < segments.length; i++) {
-        const segment = segments[i];
+        const segmentIndex = getSegmentIndex(i, playlist, currentTime);
+        const segment = segments[segmentIndex];
 
         if (segment.timeline === currentTimeline &&
             typeof segment.start !== 'undefined') {
@@ -89,7 +103,7 @@ export const syncPointStrategies = [
             lastDistance = distance;
             syncPoint = {
               time: segment.start,
-              segmentIndex: i
+              segmentIndex
             };
           }
 
@@ -161,7 +175,7 @@ export default class SyncController extends videojs.EventTarget {
     // ...for synching across variants
     this.timelines = [];
     this.discontinuities = [];
-    this.datetimeToDisplayTime = null;
+    this.timelineToDatetimeMappings = {};
 
     this.logger_ = logger('SyncController');
   }
@@ -351,19 +365,25 @@ export default class SyncController extends videojs.EventTarget {
   }
 
   /**
-   * Save the mapping from playlist's ProgramDateTime to display. This should
-   * only ever happen once at the start of playback.
+   * Save the mapping from playlist's ProgramDateTime to display. This should only happen
+   * before segments start to load.
    *
    * @param {Playlist} playlist - The currently active playlist
    */
-  setDateTimeMapping(playlist) {
-    if (!this.datetimeToDisplayTime &&
-        playlist.segments &&
+  setDateTimeMappingForStart(playlist) {
+    // It's possible for the playlist to be updated before playback starts, meaning time
+    // zero is not yet set. If, during these playlist refreshes, a discontinuity is
+    // crossed, then the old time zero mapping (for the prior timeline) would be retained
+    // unless the mappings are cleared.
+    this.timelineToDatetimeMappings = {};
+
+    if (playlist.segments &&
         playlist.segments.length &&
         playlist.segments[0].dateTimeObject) {
-      const playlistTimestamp = playlist.segments[0].dateTimeObject.getTime() / 1000;
+      const firstSegment = playlist.segments[0];
+      const playlistTimestamp = firstSegment.dateTimeObject.getTime() / 1000;
 
-      this.datetimeToDisplayTime = -playlistTimestamp;
+      this.timelineToDatetimeMappings[firstSegment.timeline] = -playlistTimestamp;
     }
   }
 
@@ -377,7 +397,7 @@ export default class SyncController extends videojs.EventTarget {
    *        The current active request information
    * @param {boolean} options.shouldSaveTimelineMapping
    *        If there's a timeline change, determines if the timeline mapping should be
-   *        saved in timelines.
+   *        saved for timeline mapping and program date time mappings.
    */
   saveSegmentTimingInfo({ segmentInfo, shouldSaveTimelineMapping }) {
     const didCalculateSegmentTimeMapping = this.calculateSegmentTimeMapping_(
@@ -385,6 +405,7 @@ export default class SyncController extends videojs.EventTarget {
       segmentInfo.timingInfo,
       shouldSaveTimelineMapping
     );
+    const segment = segmentInfo.segment;
 
     if (didCalculateSegmentTimeMapping) {
       this.saveDiscontinuitySyncInfo_(segmentInfo);
@@ -394,9 +415,15 @@ export default class SyncController extends videojs.EventTarget {
       if (!segmentInfo.playlist.syncInfo) {
         segmentInfo.playlist.syncInfo = {
           mediaSequence: segmentInfo.playlist.mediaSequence + segmentInfo.mediaIndex,
-          time: segmentInfo.segment.start
+          time: segment.start
         };
       }
+    }
+
+    const dateTime = segment.dateTimeObject;
+
+    if (segment.discontinuity && shouldSaveTimelineMapping && dateTime) {
+      this.timelineToDatetimeMappings[segment.timeline] = -(dateTime.getTime() / 1000);
     }
   }
 
@@ -433,7 +460,7 @@ export default class SyncController extends videojs.EventTarget {
     const segment = segmentInfo.segment;
     let mappingObj = this.timelines[segmentInfo.timeline];
 
-    if (segmentInfo.timestampOffset !== null) {
+    if (typeof segmentInfo.timestampOffset === 'number') {
       mappingObj = {
         time: segmentInfo.startOfSegment,
         mapping: segmentInfo.startOfSegment - timingInfo.start

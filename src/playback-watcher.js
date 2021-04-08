@@ -11,7 +11,6 @@
 import window from 'global/window';
 import * as Ranges from './ranges';
 import logger from './util/logger';
-import videojs from 'video.js';
 
 // Set of events that reset the playback-watcher time check logic and clear the timeout
 const timerCancelEvents = [
@@ -76,6 +75,7 @@ export default class PlaybackWatcher {
     this.tech_ = options.tech;
     this.seekable = options.seekable;
     this.allowSeeksWithinUnsafeLiveWindow = options.allowSeeksWithinUnsafeLiveWindow;
+    this.liveRangeSafeTimeDelta = options.liveRangeSafeTimeDelta;
     this.media = options.media;
 
     this.consecutiveUpdates = 0;
@@ -86,6 +86,7 @@ export default class PlaybackWatcher {
 
     this.logger_('initialize');
 
+    const playHandler = () => this.monitorCurrentTime_();
     const canPlayHandler = () => this.monitorCurrentTime_();
     const waitingHandler = () => this.techWaiting_();
     const cancelTimerHandler = () => this.cancelTimer_();
@@ -119,6 +120,19 @@ export default class PlaybackWatcher {
     this.tech_.on(timerCancelEvents, cancelTimerHandler);
     this.tech_.on('canplay', canPlayHandler);
 
+    /*
+      An edge case exists that results in gaps not being skipped when they exist at the beginning of a stream. This case
+      is surfaced in one of two ways:
+
+      1)  The `waiting` event is fired before the player has buffered content, making it impossible
+          to find or skip the gap. The `waiting` event is followed by a `play` event. On first play
+          we can check if playback is stalled due to a gap, and skip the gap if necessary.
+      2)  A source with a gap at the beginning of the stream is loaded programatically while the player
+          is in a playing state. To catch this case, it's important that our one-time play listener is setup
+          even if the player is in a playing state
+    */
+    this.tech_.one('play', playHandler);
+
     // Define the dispose function to clean up our events
     this.dispose = () => {
       this.logger_('dispose');
@@ -126,6 +140,7 @@ export default class PlaybackWatcher {
       this.tech_.off('waiting', waitingHandler);
       this.tech_.off(timerCancelEvents, cancelTimerHandler);
       this.tech_.off('canplay', canPlayHandler);
+      this.tech_.off('play', playHandler);
 
       loaderTypes.forEach((type) => {
         mpc[`${type}SegmentLoader_`].off('appendsdone', loaderChecks[type].updateend);
@@ -220,14 +235,6 @@ export default class PlaybackWatcher {
     this.tech_.trigger({type: 'usage', name: `vhs-${type}-download-exclusion`});
 
     if (type === 'subtitle') {
-      // TODO: Is there anything else that we can do here?
-      // removing the track and disabling could have accesiblity implications.
-      const track = loader.track();
-      const label = track.label || track.language || 'Unknown';
-
-      videojs.log.warn(`Text track "${label}" is not working correctly. It will be disabled and excluded.`);
-      track.mode = 'disabled';
-      this.tech_.textTracks().removeTrack(track);
       return;
     }
 
@@ -511,7 +518,7 @@ export default class PlaybackWatcher {
     if (seekable.length &&
         // can't fall before 0 and 0 seekable start identifies VOD stream
         seekable.start(0) > 0 &&
-        currentTime < seekable.start(0) - Ranges.SAFE_TIME_DELTA) {
+        currentTime < seekable.start(0) - this.liveRangeSafeTimeDelta) {
       return true;
     }
 

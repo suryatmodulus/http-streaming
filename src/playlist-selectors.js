@@ -143,6 +143,8 @@ export const comparePlaylistResolution = function(left, right) {
  *        Current height of the player element (should account for the device pixel ratio)
  * @param {boolean} limitRenditionByPlayerDimensions
  *        True if the player width and height should be used during the selection, false otherwise
+ * @param {Object} masterPlaylistController
+ *        the current masterPlaylistController object
  * @return {Playlist} the highest bitrate playlist less than the
  * currently detected bandwidth, accounting for some amount of
  * bandwidth variance
@@ -152,8 +154,14 @@ export const simpleSelector = function(
   playerBandwidth,
   playerWidth,
   playerHeight,
-  limitRenditionByPlayerDimensions
+  limitRenditionByPlayerDimensions,
+  masterPlaylistController
 ) {
+
+  // If we end up getting called before `master` is available, exit early
+  if (!master) {
+    return;
+  }
 
   const options = {
     bandwidth: playerBandwidth,
@@ -161,13 +169,23 @@ export const simpleSelector = function(
     height: playerHeight,
     limitRenditionByPlayerDimensions
   };
-  // convert the playlists to an intermediary representation to make comparisons easier
-  let sortedPlaylistReps = master.playlists.map((playlist) => {
-    let bandwidth;
-    const width = playlist.attributes.RESOLUTION && playlist.attributes.RESOLUTION.width;
-    const height = playlist.attributes.RESOLUTION && playlist.attributes.RESOLUTION.height;
 
-    bandwidth = playlist.attributes.BANDWIDTH;
+  let playlists = master.playlists;
+
+  // if playlist is audio only, select between currently active audio group playlists.
+  if (Playlist.isAudioOnly(master)) {
+    playlists = masterPlaylistController.getAudioTrackPlaylists_();
+    // add audioOnly to options so that we log audioOnly: true
+    // at the buttom of this function for debugging.
+    options.audioOnly = true;
+  }
+  // convert the playlists to an intermediary representation to make comparisons easier
+  let sortedPlaylistReps = playlists.map((playlist) => {
+    let bandwidth;
+    const width = playlist.attributes && playlist.attributes.RESOLUTION && playlist.attributes.RESOLUTION.width;
+    const height = playlist.attributes && playlist.attributes.RESOLUTION && playlist.attributes.RESOLUTION.height;
+
+    bandwidth = playlist.attributes && playlist.attributes.BANDWIDTH;
 
     bandwidth = bandwidth || window.Number.MAX_VALUE;
 
@@ -301,7 +319,8 @@ export const lastBandwidthSelector = function() {
     this.systemBandwidth,
     parseInt(safeGetComputedStyle(this.tech_.el(), 'width'), 10) * pixelRatio,
     parseInt(safeGetComputedStyle(this.tech_.el(), 'height'), 10) * pixelRatio,
-    this.limitRenditionByPlayerDimensions
+    this.limitRenditionByPlayerDimensions,
+    this.masterPlaylistController_
   );
 };
 
@@ -339,7 +358,8 @@ export const movingAverageBandwidthSelector = function(decay) {
       average,
       parseInt(safeGetComputedStyle(this.tech_.el(), 'width'), 10) * pixelRatio,
       parseInt(safeGetComputedStyle(this.tech_.el(), 'height'), 10) * pixelRatio,
-      this.limitRenditionByPlayerDimensions
+      this.limitRenditionByPlayerDimensions,
+      this.masterPlaylistController_
     );
   };
 };

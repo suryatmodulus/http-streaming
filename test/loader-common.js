@@ -13,7 +13,7 @@ import { MasterPlaylistController } from '../src/master-playlist-controller';
 import SourceUpdater from '../src/source-updater';
 import SyncController from '../src/sync-controller';
 import TimelineChangeController from '../src/timeline-change-controller';
-import Decrypter from 'worker!../src/decrypter-worker.worker.js';
+import Decrypter from 'worker!../src/decrypter-worker.js';
 import window from 'global/window';
 /* eslint-disable no-unused-vars */
 // we need this so that it can register VHS with videojs
@@ -120,6 +120,26 @@ export const LoaderCommonFactory = ({
 }) => {
   let loader;
 
+  const appendPart = function(segmentIndex, partIndex) {
+    this.clock.tick(1);
+
+    QUnit.assert.equal(
+      this.requests[0].url,
+      `segment${segmentIndex}.part${partIndex}.ts`,
+      `requested mediaIndex #${segmentIndex} partIndex #${partIndex}`
+    );
+    standardXHRResponse(this.requests.shift(), testData());
+
+    if (usesAsyncAppends) {
+      return new Promise((resolve, reject) => {
+        loader.one('appended', resolve);
+        loader.one('error', reject);
+      });
+    }
+
+    return Promise.resolve();
+  };
+
   QUnit.module('Loader Common', function(hooks) {
     hooks.beforeEach(function(assert) {
       // Assume this module is nested and the parent module uses CommonHooks.beforeEach
@@ -192,7 +212,7 @@ export const LoaderCommonFactory = ({
 
         if (usesAsyncAppends) {
           return new Promise((resolve, reject) => {
-            loader.one('appending', loader.pause);
+            loader.one('appended', loader.pause);
             loader.one('appended', resolve);
             loader.one('error', reject);
           });
@@ -340,7 +360,7 @@ export const LoaderCommonFactory = ({
     });
 
     QUnit.test(
-      'aborts request at progress events if bandwidth is too low',
+      'triggers earlyabort at progress events if bandwidth is too low',
       function(assert) {
         const playlist1 = playlistWithDuration(10, { uri: 'playlist1.m3u8' });
         const playlist2 = playlistWithDuration(10, { uri: 'playlist2.m3u8' });
@@ -425,7 +445,7 @@ export const LoaderCommonFactory = ({
         });
 
         assert.equal(bandwidthupdates, 0, 'bandwidth not updated');
-        assert.ok(this.requests[0].aborted, 'request aborted');
+        assert.ok(!this.requests[0].aborted, 'request not aborted');
         assert.equal(earlyAborts, 1, 'earlyabort event triggered');
       }
     );
@@ -801,6 +821,93 @@ export const LoaderCommonFactory = ({
         return Promise.resolve();
       });
     });
+
+    // only main/fmp4 segment loaders use parts/partIndex
+    if (usesAsyncAppends) {
+      QUnit.test('mediaIndex and partIndex are used', function(assert) {
+
+        return setupMediaSource(loader.mediaSource_, loader.sourceUpdater_).then(() => {
+          loader.playlist(playlistWithDuration(50, {
+            mediaSequence: 0,
+            endList: false,
+            llhls: true
+          }));
+
+          loader.load();
+          loader.mediaIndex = 2;
+          return Promise.resolve();
+        }).then(() => appendPart.call(this, 2, 0))
+          .then(() => appendPart.call(this, 2, 1))
+          .then(() => appendPart.call(this, 2, 2))
+          .then(() => appendPart.call(this, 2, 3))
+          .then(() => appendPart.call(this, 2, 4))
+          .then(() => appendPart.call(this, 3, 0));
+      });
+
+      QUnit.test('mediaIndex and partIndex survive playlist change', function(assert) {
+        return setupMediaSource(loader.mediaSource_, loader.sourceUpdater_).then(() => {
+          loader.playlist(playlistWithDuration(50, {
+            mediaSequence: 0,
+            endList: false,
+            llhls: true
+          }));
+
+          loader.load();
+          loader.mediaIndex = 4;
+          return Promise.resolve();
+        }).then(() => appendPart.call(this, 4, 0))
+          .then(() => appendPart.call(this, 4, 1))
+          .then(() => appendPart.call(this, 4, 2))
+          .then(() => {
+
+            // Update the playlist shifting the mediaSequence by 2 which will result
+            // in a decrement of the mediaIndex by 2 to 1
+            loader.playlist(playlistWithDuration(50, {
+              mediaSequence: 2,
+              endList: false,
+              llhls: true
+            }));
+            // verify that we still try to append the next part for that segment.
+            return appendPart.call(this, 2, 3);
+          }).then(() => appendPart.call(this, 2, 4));
+      });
+
+      QUnit.test('drops partIndex if playlist update drops parts', function(assert) {
+        assert.timeout(100000000000000000000);
+        return setupMediaSource(loader.mediaSource_, loader.sourceUpdater_).then(() => {
+          loader.playlist(playlistWithDuration(50, {
+            mediaSequence: 0,
+            endList: false,
+            llhls: true
+          }));
+
+          loader.load();
+          loader.mediaIndex = 4;
+          return Promise.resolve();
+        }).then(() => appendPart.call(this, 4, 0))
+          .then(() => appendPart.call(this, 4, 1))
+          .then(() => appendPart.call(this, 4, 2))
+          .then(() => {
+
+            // Update the playlist shifting the mediaSequence by 4 which will result
+            // in a decrement of the mediaIndex by 4 to 0
+            loader.playlist(playlistWithDuration(50, {
+              mediaSequence: 4,
+              endList: false,
+              llhls: true
+            }));
+
+            assert.equal(loader.partIndex, null, 'partIndex was dropped');
+            this.clock.tick(1);
+
+            assert.equal(
+              this.requests[0].url,
+              '1.ts',
+              'requested mediaIndex 1 only'
+            );
+          });
+      });
+    }
 
     QUnit.test('segment 404s should trigger an error', function(assert) {
       const errors = [];
